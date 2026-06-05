@@ -1,3 +1,4 @@
+use crate::thread::{RevertPreviewResponse, RevertStep, Thread};
 use acp::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
@@ -12,6 +13,7 @@ use acp::schema::{
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
+use agent_client_protocol::{JsonRpcRequest, JsonRpcResponse};
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
@@ -28,6 +30,7 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -36,7 +39,47 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::Thread;
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/revert/listSteps", response = RevertListStepsResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertListStepsRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertListStepsResponse {
+    pub steps: Vec<RevertStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/revert/preview", response = RevertPreviewResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertPreviewRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    #[serde(rename = "targetNodeId")]
+    pub target_node_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/revert/execute", response = RevertExecuteResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertExecuteRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    #[serde(rename = "targetNodeId")]
+    pub target_node_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertExecuteResponse {
+    #[serde(rename = "forkedSessionId")]
+    pub forked_session_id: SessionId,
+    pub outcomes: Vec<serde_json::Value>,
+}
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -292,6 +335,51 @@ impl CodexAgent {
                 },
                 acp::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: RevertListStepsRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.revert_list_steps(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: RevertPreviewRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.revert_preview(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: RevertExecuteRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.revert_execute(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
             .connect_to(transport)
             .await
     }
@@ -367,7 +455,8 @@ impl CodexAgent {
                             oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
-                            experimental_environment: None,
+                            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
+                                .to_string(),
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
                         },
@@ -407,7 +496,8 @@ impl CodexAgent {
                             oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
-                            experimental_environment: None,
+                            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
+                                .to_string(),
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
                         },
@@ -431,13 +521,24 @@ impl CodexAgent {
         let InitializeRequest {
             protocol_version,
             client_capabilities,
-            client_info: _, // TODO: save and pass into Codex somehow
+            client_info,
+            meta,
             ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
         let protocol_version = ProtocolVersion::V1;
 
-        *self.client_capabilities.lock().unwrap() = client_capabilities;
+        if let Some(ref info) = client_info {
+            info!(
+                "Connected Client Info: name={}, version={}",
+                info.name, info.version
+            );
+        }
+        if let Ok(json_caps) = serde_json::to_string_pretty(&client_capabilities) {
+            info!("Client Capabilities: {}", json_caps);
+        }
+
+        *self.client_capabilities.lock().unwrap() = client_capabilities.clone();
 
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
@@ -449,6 +550,8 @@ impl CodexAgent {
             .close(SessionCloseCapabilities::new())
             .list(SessionListCapabilities::new());
 
+        agent_capabilities.meta = client_capabilities.meta;
+
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
             CodexAuthMethod::CodexApiKey.into(),
@@ -459,10 +562,16 @@ impl CodexAgent {
             auth_methods.remove(0);
         }
 
-        Ok(InitializeResponse::new(protocol_version)
+        let mut response = InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
             .agent_info(Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
-            .auth_methods(auth_methods))
+            .auth_methods(auth_methods);
+
+        if let Some(meta) = meta {
+            response = response.meta(meta);
+        }
+
+        Ok(response)
     }
 
     async fn authenticate(
@@ -759,11 +868,15 @@ impl CodexAgent {
         // Check before sending if authentication was successful or not
         self.check_auth().await?;
 
+        let user_message_id = request.message_id.clone();
+
         // Get the session state
         let thread = self.get_thread(&request.session_id)?;
         let stop_reason = thread.prompt(request).await?;
 
-        Ok(PromptResponse::new(stop_reason))
+        let mut response = PromptResponse::new(stop_reason);
+        response.user_message_id = user_message_id;
+        Ok(response)
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
@@ -812,6 +925,52 @@ impl CodexAgent {
         let config_options = thread.config_options().await?;
 
         Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
+
+    async fn revert_list_steps(
+        &self,
+        request: RevertListStepsRequest,
+    ) -> Result<RevertListStepsResponse, Error> {
+        info!("Listing revert steps for session: {}", request.session_id);
+        let thread = self.get_thread(&request.session_id)?;
+        let steps = thread.list_steps().await?;
+        Ok(RevertListStepsResponse { steps })
+    }
+
+    async fn revert_preview(
+        &self,
+        request: RevertPreviewRequest,
+    ) -> Result<RevertPreviewResponse, Error> {
+        info!(
+            "Previewing revert for session: {} target_node_id: {}",
+            request.session_id, request.target_node_id
+        );
+        let thread = self.get_thread(&request.session_id)?;
+        let response = thread.preview(request.target_node_id).await?;
+        Ok(response)
+    }
+
+    async fn revert_execute(
+        &self,
+        request: RevertExecuteRequest,
+    ) -> Result<RevertExecuteResponse, Error> {
+        info!(
+            "Executing revert for session: {} target_node_id: {}",
+            request.session_id, request.target_node_id
+        );
+        let thread = self.get_thread(&request.session_id)?;
+
+        thread.revert(request.target_node_id).await?;
+
+        let old_thread = self.sessions.lock().unwrap().remove(&request.session_id);
+        if let Some(old_thread) = old_thread {
+            let _unused = old_thread.shutdown().await;
+        }
+
+        Ok(RevertExecuteResponse {
+            forked_session_id: request.session_id.clone(),
+            outcomes: Vec::new(),
+        })
     }
 }
 

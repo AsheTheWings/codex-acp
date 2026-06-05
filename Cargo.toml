@@ -21,19 +21,19 @@ path = "src/lib.rs"
 agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
 anyhow = "1"
 clap = "4"
-codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
-codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.133.0" }
+codex-apply-patch = { path = "../codex/codex-rs/apply-patch" }
+codex-arg0 = { path = "../codex/codex-rs/arg0" }
+codex-config = { path = "../codex/codex-rs/config" }
+codex-core = { path = "../codex/codex-rs/core" }
+codex-exec-server = { path = "../codex/codex-rs/exec-server" }
+codex-extension-api = { path = "../codex/codex-rs/ext/extension-api" }
+codex-mcp-server = { path = "../codex/codex-rs/mcp-server" }
+codex-models-manager = { path = "../codex/codex-rs/models-manager" }
+codex-protocol = { path = "../codex/codex-rs/protocol" }
+codex-login = { path = "../codex/codex-rs/login" }
+codex-shell-command = { path = "../codex/codex-rs/shell-command" }
+codex-utils-approval-presets = { path = "../codex/codex-rs/utils/approval-presets" }
+codex-utils-cli = { path = "../codex/codex-rs/utils/cli" }
 # Pin allocative to 0.3.4 because starlark_map 0.13.0 exposes hashbrown 0.14
 # internals that need allocative's matching hashbrown implementation.
 allocative = "=0.3.4"
@@ -46,6 +46,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 shlex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 heck = "0.5.0"
@@ -60,6 +61,3 @@ unused = "warn"
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
-
-[patch."https://github.com/openai/codex"]
-codex-utils-pty = { path = "vendor/codex-utils-pty" }

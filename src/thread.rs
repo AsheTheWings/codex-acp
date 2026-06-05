@@ -7,8 +7,10 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use agent_client_protocol::{
-    Client, ConnectionTo, Error,
+    Client, ConnectionTo, Error, JsonRpcResponse,
     schema::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
@@ -43,8 +45,8 @@ use codex_protocol::{
     error::CodexErr,
     mcp::CallToolResult,
     models::{
-        ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
-        WebSearchAction,
+        ActivePermissionProfile, AdditionalPermissionProfile, LocalShellAction, PermissionProfile,
+        ResponseItem, WebSearchAction,
     },
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
@@ -67,7 +69,7 @@ use codex_protocol::{
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
         ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, W3cTraceContext, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -213,7 +215,24 @@ fn mode_trusts_project(mode_id: &str) -> bool {
 pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
+    fn submit_user_input_with_client_user_message_id(
+        &self,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
+    fn load_history(
+        &self,
+        include_archived: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<codex_core::StoredThreadHistory, codex_core::ThreadStoreError>,
+                > + Send
+                + '_,
+        >,
+    >;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -224,8 +243,35 @@ impl CodexThreadImpl for CodexThread {
         Box::pin(self.submit(op))
     }
 
+    fn submit_user_input_with_client_user_message_id(
+        &self,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>> {
+        Box::pin(self.submit_user_input_with_client_user_message_id(
+            op,
+            trace,
+            client_user_message_id,
+        ))
+    }
+
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
+    }
+
+    fn load_history(
+        &self,
+        include_archived: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<codex_core::StoredThreadHistory, codex_core::ThreadStoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.load_history(include_archived))
     }
 }
 
@@ -301,6 +347,10 @@ enum ThreadMessage {
     },
     ReplayHistory {
         history: Vec<RolloutItem>,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    Revert {
+        target_node_id: usize,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     PermissionRequestResolved {
@@ -454,6 +504,129 @@ impl Thread {
         response_rx
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn revert(&self, target_node_id: usize) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let message = ThreadMessage::Revert {
+            target_node_id,
+            response_tx,
+        };
+        if self.message_tx.send(message).is_err() {
+            return Err(
+                Error::internal_error().data("Failed to send revert message to thread actor")
+            );
+        }
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn list_steps(&self) -> Result<Vec<RevertStep>, Error> {
+        let history = match self.thread.load_history(true).await {
+            Ok(h) => h,
+            Err(e) => {
+                info!("Failed to load thread history for revert steps (treating as empty history): {}", e);
+                return Ok(Vec::new());
+            }
+        };
+
+        let rollout_items = history.items;
+
+        let turns = reconstruct_turns(&rollout_items);
+
+        let mut steps = Vec::new();
+        let mut step_number = 1;
+
+        let mut current_line_idx = 0;
+        for turn_items in &turns {
+            let turn_start_idx = current_line_idx;
+            current_line_idx += turn_items.len();
+            let turn_end_idx = current_line_idx;
+
+            let user_msg = turn_items.iter().find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::UserMessage(user_event)) => {
+                    Some(user_event.message.clone())
+                }
+                _ => None,
+            });
+
+            if let Some(msg) = user_msg {
+                let client_user_message_id = turn_items.iter().find_map(|item| match item {
+                    RolloutItem::TurnContext(turn_context) => {
+                        turn_context.client_user_message_id.clone()
+                    }
+                    _ => None,
+                });
+
+                let user_message_id =
+                    client_user_message_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                let summary = msg.chars().take(80).collect::<String>();
+
+                steps.push(RevertStep {
+                    step_number,
+                    user_message_id,
+                    revert_target_node_id: turn_start_idx,
+                    fork_target_node_id: turn_end_idx,
+                    summary,
+                });
+                step_number += 1;
+            }
+        }
+
+        Ok(steps)
+    }
+
+    pub async fn preview(&self, target_node_id: usize) -> Result<RevertPreviewResponse, Error> {
+        let history = self
+            .thread
+            .load_history(true)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let rollout_items = history.items;
+
+        let mut warnings = Vec::new();
+        if target_node_id < rollout_items.len() {
+            for item in &rollout_items[target_node_id..] {
+                match item {
+                    RolloutItem::ResponseItem(response_item) => match response_item {
+                        ResponseItem::LocalShellCall { action, .. } => {
+                            let cmd = match action {
+                                LocalShellAction::Exec(exec_action) => {
+                                    exec_action.command.join(" ")
+                                }
+                            };
+                            warnings.push(IrreversibleWarning {
+                                tool_name: "shell".to_string(),
+                                description: format!("Executed terminal command: {}", cmd),
+                            });
+                        }
+                        ResponseItem::FunctionCall {
+                            name, arguments, ..
+                        } => {
+                            let name_str = name.as_str();
+                            warnings.push(IrreversibleWarning {
+                                tool_name: name_str.to_string(),
+                                description: format!(
+                                    "Invoked tool: {} with args: {}",
+                                    name_str, arguments
+                                ),
+                            });
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(RevertPreviewResponse {
+            file_actions: Vec::new(),
+            irreversible_warnings: warnings,
+            conflicts: Vec::new(),
+        })
     }
 
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -800,18 +973,21 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
+    Revert(RevertState),
 }
 
 impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
             Self::Prompt(state) => state.is_active(),
+            Self::Revert(state) => state.is_active(),
         }
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             Self::Prompt(state) => state.handle_event(client, event).await,
+            Self::Revert(state) => state.handle_event(event),
         }
     }
 
@@ -833,6 +1009,7 @@ impl SubmissionState {
                     )
                     .await
             }
+            Self::Revert(_) => Ok(()),
         }
     }
 
@@ -841,14 +1018,50 @@ impl SubmissionState {
             Self::Prompt(state) => {
                 state.detach_pending_interactions();
             }
+            Self::Revert(_) => {}
         }
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
-            drop(response_tx.send(Err(err)));
+        match self {
+            Self::Prompt(state) => {
+                if let Some(response_tx) = state.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+            Self::Revert(state) => {
+                if let Some(response_tx) = state.response_tx.take() {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+        }
+    }
+}
+
+struct RevertState {
+    response_tx: Option<oneshot::Sender<Result<(), Error>>>,
+}
+
+impl RevertState {
+    fn is_active(&self) -> bool {
+        self.response_tx.is_some()
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        match event {
+            EventMsg::ThreadRolledBack(..) => {
+                if let Some(tx) = self.response_tx.take() {
+                    let _unused = tx.send(Ok(()));
+                }
+            }
+            EventMsg::Error(err) => {
+                if let Some(tx) = self.response_tx.take() {
+                    let _unused = tx
+                        .send(Err(Error::internal_error()
+                            .data(format!("Rollback failed: {}", err.message))));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -861,7 +1074,10 @@ struct ActiveCommand {
 }
 
 struct PromptState {
+    cwd: PathBuf,
     submission_id: String,
+    _user_message_id: String,
+    assistant_message_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
     active_image_generations: HashSet<String>,
@@ -878,13 +1094,19 @@ struct PromptState {
 
 impl PromptState {
     fn new(
+        cwd: PathBuf,
         submission_id: String,
+        user_message_id: String,
+        assistant_message_id: String,
         thread: Arc<dyn CodexThreadImpl>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
     ) -> Self {
         Self {
+            cwd,
             submission_id,
+            _user_message_id: user_message_id,
+            assistant_message_id,
             active_commands: HashMap::new(),
             active_web_search: None,
             active_image_generations: HashSet::new(),
@@ -1136,6 +1358,7 @@ impl PromptState {
                 collaboration_mode_kind,
                 turn_id,
                 started_at: _,
+                ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -1169,7 +1392,11 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text(delta);
+                let message_id = Some(self.assistant_message_id.clone());
+                let meta = Some(Meta::from_iter([
+                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
+                ]));
+                client.send_agent_text_with_meta(delta, message_id, meta);
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -1187,7 +1414,11 @@ impl PromptState {
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought(delta);
+                let message_id = Some(self.assistant_message_id.clone());
+                let meta = Some(Meta::from_iter([
+                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
+                ]));
+                client.send_agent_thought_with_meta(delta, message_id, meta);
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
@@ -1196,25 +1427,41 @@ impl PromptState {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought("\n\n");
+                let message_id = Some(self.assistant_message_id.clone());
+                let meta = Some(Meta::from_iter([
+                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
+                ]));
+                client.send_agent_thought_with_meta("\n\n", message_id, meta);
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
-                    client.send_agent_text(message);
+                    let message_id = Some(self.assistant_message_id.clone());
+                    let meta = Some(Meta::from_iter([
+                        ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
+                    ]));
+                    client.send_agent_text_with_meta(message, message_id, meta);
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
-                    client.send_agent_thought(text);
+                    let message_id = Some(self.assistant_message_id.clone());
+                    let meta = Some(Meta::from_iter([
+                        ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
+                    ]));
+                    client.send_agent_thought_with_meta(text, message_id, meta);
                 }
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
-                client.send_agent_text(format_thread_goal_update(&event));
+                let message_id = Some(self.assistant_message_id.clone());
+                let meta = Some(Meta::from_iter([
+                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
+                ]));
+                client.send_agent_text_with_meta(format_thread_goal_update(&event), message_id, meta);
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -1628,7 +1875,8 @@ impl PromptState {
             turn_id: _,
             ..
         } = event;
-        let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+        let (title, locations, content) =
+            extract_tool_call_content_from_changes(&self.cwd, changes);
         let request_key = patch_request_key(&call_id);
         let options = vec![
             PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
@@ -1672,7 +1920,8 @@ impl PromptState {
             turn_id: _,
         } = event;
 
-        let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+        let (title, locations, content) =
+            extract_tool_call_content_from_changes(&self.cwd, changes);
 
         client.send_tool_call(
             ToolCall::new(call_id, title)
@@ -1692,7 +1941,8 @@ impl PromptState {
             return;
         }
 
-        let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+        let (title, locations, content) =
+            extract_tool_call_content_from_changes(&self.cwd, changes);
 
         client.send_tool_call_update(ToolCallUpdate::new(
             call_id,
@@ -1719,7 +1969,8 @@ impl PromptState {
         } = event;
 
         let (title, locations, content) = if !changes.is_empty() {
-            let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+            let (title, locations, content) =
+                extract_tool_call_content_from_changes(&self.cwd, changes);
             (Some(title), Some(locations), Some(content.collect()))
         } else {
             (None, None, None)
@@ -2669,16 +2920,52 @@ impl SessionClient {
         )));
     }
 
+    fn send_user_message_with_meta(
+        &self,
+        text: impl Into<String>,
+        message_id: Option<String>,
+        meta: Option<Meta>,
+    ) {
+        let mut chunk = ContentChunk::new(text.into().into());
+        chunk.message_id = message_id;
+        chunk.meta = meta;
+        self.send_notification(SessionUpdate::UserMessageChunk(chunk));
+    }
+
     fn send_agent_text(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
             text.into().into(),
         )));
     }
 
+    fn send_agent_text_with_meta(
+        &self,
+        text: impl Into<String>,
+        message_id: Option<String>,
+        meta: Option<Meta>,
+    ) {
+        let mut chunk = ContentChunk::new(text.into().into());
+        chunk.message_id = message_id;
+        chunk.meta = meta;
+        self.send_notification(SessionUpdate::AgentMessageChunk(chunk));
+    }
+
     fn send_agent_thought(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             text.into().into(),
         )));
+    }
+
+    fn send_agent_thought_with_meta(
+        &self,
+        text: impl Into<String>,
+        message_id: Option<String>,
+        meta: Option<Meta>,
+    ) {
+        let mut chunk = ContentChunk::new(text.into().into());
+        chunk.message_id = message_id;
+        chunk.meta = meta;
+        self.send_notification(SessionUpdate::AgentThoughtChunk(chunk));
     }
 
     fn send_tool_call(&self, tool_call: ToolCall) {
@@ -2890,6 +3177,12 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_replay_history(history);
                 drop(response_tx.send(result));
             }
+            ThreadMessage::Revert {
+                target_node_id,
+                response_tx,
+            } => {
+                self.handle_revert(target_node_id, response_tx).await;
+            }
             ThreadMessage::PermissionRequestResolved {
                 submission_id,
                 interaction_id,
@@ -2947,6 +3240,10 @@ impl<A: Auth> ThreadActor<A> {
             AvailableCommand::new(
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
+            ),
+            AvailableCommand::new(
+                "info",
+                "Print current session details, model and configuration information",
             ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
@@ -3265,6 +3562,12 @@ impl<A: Auth> ThreadActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
+                "info" => {
+                    let info_text = self.get_info_text().await;
+                    self.client.send_agent_text(info_text);
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -3274,6 +3577,7 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
                         thread_settings: Default::default(),
                     }
                 }
@@ -3327,6 +3631,7 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
                         thread_settings: Default::default(),
                     }
                 }
@@ -3337,21 +3642,38 @@ impl<A: Auth> ThreadActor<A> {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
                 thread_settings: Default::default(),
             }
         }
 
-        let submission_id = self
-            .thread
-            .submit(op.clone())
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let user_message_id = request
+            .message_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let assistant_message_id = Uuid::new_v4().to_string();
+
+        let submission_id = if matches!(op, Op::UserInput { .. }) {
+            self.thread
+                .submit_user_input_with_client_user_message_id(
+                    op.clone(),
+                    None,
+                    Some(user_message_id.clone()),
+                )
+                .await
+        } else {
+            self.thread.submit(op.clone()).await
+        }
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
         let state = SubmissionState::Prompt(PromptState::new(
+            self.config.cwd.as_path().to_path_buf(),
             submission_id.clone(),
+            user_message_id,
+            assistant_message_id,
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
@@ -3404,6 +3726,61 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn get_current_model(&self) -> String {
         self.models_manager.get_model(&self.config.model).await
+    }
+
+    async fn get_info_text(&self) -> String {
+        let current_model = self.get_current_model().await;
+        let provider = &self.config.model_provider_id;
+        let effort = self
+            .config
+            .model_reasoning_effort
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "default".to_string());
+
+        let preset = if let Some(mode_id) = current_session_mode_id(&self.config) {
+            mode_id.0.to_string()
+        } else {
+            "custom".to_string()
+        };
+
+        let sandbox = if let Some(profile) = self.config.permissions.active_permission_profile() {
+            format!("Permission Profile `{}`", profile.id)
+        } else {
+            "Custom Profile / Legacy Sandbox".to_string()
+        };
+
+        let cwd = self.config.cwd.as_path().to_string_lossy().to_string();
+
+        let mut mcp_servers_list = Vec::new();
+        for name in self.config.mcp_servers.get().keys() {
+            mcp_servers_list.push(format!("- `{}`", name));
+        }
+        let mcp_servers_str = if mcp_servers_list.is_empty() {
+            "None".to_string()
+        } else {
+            mcp_servers_list.join("\n")
+        };
+
+        format!(
+            "### Codex ACP Session Info\n\n\
+             - **Session ID**: `{}`\n\
+             - **Working Directory**: `{}`\n\
+             - **Model**: `{}`\n\
+             - **Provider**: `{}`\n\
+             - **Reasoning Effort**: `{}`\n\
+             - **Approval Preset / Mode**: `{}`\n\
+             - **Sandbox/Permissions**: {}\n\n\
+             ### Connected MCP Servers\n\
+             {}\n",
+            self.client.session_id.0,
+            cwd,
+            current_model,
+            provider,
+            effort,
+            preset,
+            sandbox,
+            mcp_servers_str
+        )
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
@@ -3472,16 +3849,27 @@ impl<A: Auth> ThreadActor<A> {
     /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
     /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
     fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
-        for item in history {
-            match item {
-                RolloutItem::EventMsg(event_msg) => {
-                    self.replay_event_msg(&event_msg);
+        let turns = reconstruct_turns(&history);
+
+        for turn_items in turns {
+            let client_message_id = turn_items.iter().find_map(|item| match item {
+                RolloutItem::TurnContext(turn_context) => {
+                    turn_context.client_user_message_id.clone()
                 }
-                RolloutItem::ResponseItem(response_item) => {
-                    self.replay_response_item(&response_item);
+                _ => None,
+            });
+
+            for item in turn_items {
+                match item {
+                    RolloutItem::EventMsg(event_msg) => {
+                        self.replay_event_msg(&event_msg, client_message_id.as_deref());
+                    }
+                    RolloutItem::ResponseItem(response_item) => {
+                        self.replay_response_item(&response_item);
+                    }
+                    // Skip SessionMeta, TurnContext, Compacted
+                    _ => {}
                 }
-                // Skip SessionMeta, TurnContext, Compacted
-                _ => {}
             }
         }
         Ok(())
@@ -3489,10 +3877,28 @@ impl<A: Auth> ThreadActor<A> {
 
     /// Convert and send an EventMsg as ACP notification(s) during replay.
     /// Handles messages and reasoning - mirrors the live event handling in PromptState.
-    fn replay_event_msg(&self, msg: &EventMsg) {
+    fn replay_event_msg(&self, msg: &EventMsg, client_message_id: Option<&str>) {
         match msg {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
-                self.client.send_user_message(message.clone());
+                if let Some(id) = client_message_id {
+                    let meta = Some(Meta::from_iter([
+                        (
+                            "cognition.ai/clientMessageId".to_string(),
+                            serde_json::json!(id),
+                        ),
+                        (
+                            "cognition.ai/messageSubIndex".to_string(),
+                            serde_json::json!(0),
+                        ),
+                    ]));
+                    self.client.send_user_message_with_meta(
+                        message.clone(),
+                        Some(id.to_string()),
+                        meta,
+                    );
+                } else {
+                    self.client.send_user_message(message.clone());
+                }
             }
             EventMsg::AgentMessage(AgentMessageEvent {
                 message,
@@ -3517,6 +3923,65 @@ impl<A: Auth> ThreadActor<A> {
             // - Are handled via ResponseItem instead
             _ => {}
         }
+    }
+
+    async fn handle_revert(
+        &mut self,
+        target_node_id: usize,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    ) {
+        info!("Executing revert to target_node_id: {}", target_node_id);
+
+        let history = match self.thread.load_history(true).await {
+            Ok(history) => history,
+            Err(e) => {
+                let _unused = response_tx.send(Err(Error::internal_error().data(e.to_string())));
+                return;
+            }
+        };
+
+        let rollout_items = history.items;
+        let turns = reconstruct_turns(&rollout_items);
+        let total_turns = turns.len();
+
+        let mut k = 0;
+        let mut current_line_idx = 0;
+        for turn_items in &turns {
+            current_line_idx += turn_items.len();
+            if current_line_idx <= target_node_id {
+                k += 1;
+            } else {
+                break;
+            }
+        }
+
+        if k >= total_turns {
+            info!("Target node is at or after current state. No rollback needed.");
+            let _unused = response_tx.send(Ok(()));
+            return;
+        }
+
+        let num_turns = total_turns - k;
+        info!("Rolling back {} turns out of {}", num_turns, total_turns);
+
+        let submission_id = match self
+            .thread
+            .submit(Op::ThreadRollback {
+                num_turns: num_turns as u32,
+            })
+            .await
+        {
+            Ok(sub_id) => sub_id,
+            Err(e) => {
+                let _unused = response_tx.send(Err(Error::internal_error().data(e.to_string())));
+                return;
+            }
+        };
+
+        let state = SubmissionState::Revert(RevertState {
+            response_tx: Some(response_tx),
+        });
+        self.submissions.insert(submission_id, state);
     }
 
     /// Parse apply_patch call input to extract patch content for display.
@@ -3864,13 +4329,24 @@ fn format_uri_as_link(name: Option<String>, uri: String) -> String {
 }
 
 fn extract_tool_call_content_from_changes(
+    cwd: &std::path::Path,
     changes: HashMap<PathBuf, FileChange>,
 ) -> (
     String,
     Vec<ToolCallLocation>,
     impl Iterator<Item = ToolCallContent>,
 ) {
-    let changes = changes.into_iter().collect_vec();
+    let changes = changes
+        .into_iter()
+        .map(|(path, change)| {
+            let abs_path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            (abs_path, change)
+        })
+        .collect_vec();
     let title = if changes.is_empty() {
         "Edit".to_string()
     } else {
@@ -4216,6 +4692,69 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     }
     let rest = stripped[name_end..].trim_start();
     Some((name, rest))
+}
+
+fn reconstruct_turns(history: &[RolloutItem]) -> Vec<Vec<RolloutItem>> {
+    let mut turns: Vec<Vec<RolloutItem>> = Vec::new();
+    let mut current_turn: Vec<RolloutItem> = Vec::new();
+
+    for item in history {
+        match item {
+            RolloutItem::TurnContext(..) => {
+                if !current_turn.is_empty() {
+                    turns.push(current_turn);
+                }
+                current_turn = vec![item.clone()];
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                if !current_turn.is_empty() {
+                    turns.push(current_turn);
+                    current_turn = Vec::new();
+                }
+                let num_to_drop = rollback.num_turns as usize;
+                turns.truncate(turns.len().saturating_sub(num_to_drop));
+            }
+            other => {
+                current_turn.push(other.clone());
+            }
+        }
+    }
+    if !current_turn.is_empty() {
+        turns.push(current_turn);
+    }
+    turns
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertStep {
+    #[serde(rename = "stepNumber")]
+    pub step_number: usize,
+    #[serde(rename = "userMessageId")]
+    pub user_message_id: String,
+    #[serde(rename = "revertTargetNodeId")]
+    pub revert_target_node_id: usize,
+    #[serde(rename = "forkTargetNodeId")]
+    pub fork_target_node_id: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertPreviewResponse {
+    #[serde(rename = "fileActions")]
+    pub file_actions: Vec<serde_json::Value>,
+    #[serde(rename = "irreversibleWarnings")]
+    pub irreversible_warnings: Vec<IrreversibleWarning>,
+    pub conflicts: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IrreversibleWarning {
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    pub description: String,
 }
 
 #[cfg(test)]
@@ -5160,12 +5699,43 @@ mod tests {
             })
         }
 
+        fn submit_user_input_with_client_user_message_id(
+            &self,
+            op: Op,
+            _trace: Option<W3cTraceContext>,
+            _client_user_message_id: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>> {
+            self.submit(op)
+        }
+
         fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
             Box::pin(async {
                 let Some(event) = self.op_rx.lock().await.recv().await else {
                     return Err(CodexErr::InternalAgentDied);
                 };
                 Ok(event)
+            })
+        }
+
+        fn load_history(
+            &self,
+            _include_archived: bool,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            codex_core::StoredThreadHistory,
+                            codex_core::ThreadStoreError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(codex_core::StoredThreadHistory {
+                    thread_id: codex_protocol::ThreadId::from_string("stub-thread-id").unwrap(),
+                    items: Vec::new(),
+                })
             })
         }
     }
@@ -5321,7 +5891,10 @@ mod tests {
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
+            PathBuf::from("."),
             "submission-id".to_string(),
+            "".to_string(),
+            "".to_string(),
             thread.clone(),
             message_tx,
             response_tx,
@@ -5403,7 +5976,10 @@ mod tests {
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
+            PathBuf::from("."),
             "submission-id".to_string(),
+            "".to_string(),
+            "".to_string(),
             thread.clone(),
             message_tx,
             response_tx,
@@ -5520,7 +6096,10 @@ mod tests {
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
+            PathBuf::from("."),
             "submission-id".to_string(),
+            "".to_string(),
+            "".to_string(),
             thread.clone(),
             message_tx,
             response_tx,
@@ -5580,8 +6159,15 @@ mod tests {
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut prompt_state =
-            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+        let mut prompt_state = PromptState::new(
+            PathBuf::from("."),
+            "submission-id".to_string(),
+            "".to_string(),
+            "".to_string(),
+            thread,
+            message_tx,
+            response_tx,
+        );
 
         prompt_state
             .handle_event(
@@ -5653,7 +6239,10 @@ mod tests {
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
+            PathBuf::from("."),
             "submission-id".to_string(),
+            "".to_string(),
+            "".to_string(),
             thread.clone(),
             message_tx,
             response_tx,

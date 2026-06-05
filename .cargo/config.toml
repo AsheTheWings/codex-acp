@@ -1,0 +1,2 @@
+[build]
+target-dir = "../codex/codex-rs/target"
