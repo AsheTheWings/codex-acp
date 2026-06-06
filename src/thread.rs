@@ -233,6 +233,7 @@ pub trait CodexThreadImpl: Send + Sync {
                 + '_,
         >,
     >;
+    fn mcp_connection_manager(&self) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -272,6 +273,10 @@ impl CodexThreadImpl for CodexThread {
         >,
     > {
         Box::pin(self.load_history(include_archived))
+    }
+
+    fn mcp_connection_manager(&self) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>> {
+        self.mcp_connection_manager()
     }
 }
 
@@ -402,6 +407,19 @@ impl Thread {
         }
     }
 
+    pub fn mcp_connection_manager(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>> {
+        self.thread.mcp_connection_manager()
+    }
+
+    pub async fn submit(&self, op: Op) -> Result<String, Error> {
+        self.thread
+            .submit(op)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))
+    }
+
     pub async fn load(&self) -> Result<LoadSessionResponse, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -526,7 +544,10 @@ impl Thread {
         let history = match self.thread.load_history(true).await {
             Ok(h) => h,
             Err(e) => {
-                info!("Failed to load thread history for revert steps (treating as empty history): {}", e);
+                info!(
+                    "Failed to load thread history for revert steps (treating as empty history): {}",
+                    e
+                );
                 return Ok(Vec::new());
             }
         };
@@ -1129,6 +1150,20 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
+    fn assistant_message_id_for_response(&self, response_id: Option<&str>) -> String {
+        response_id
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| self.assistant_message_id.clone())
+    }
+
+    fn assistant_streaming_meta(message_id: &str) -> Meta {
+        Meta::from_iter([(
+            "cognition.ai/streamingMessageId".to_string(),
+            serde_json::json!(message_id),
+        )])
+    }
+
     fn detach_pending_interactions(&mut self) {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
@@ -1143,6 +1178,8 @@ impl PromptState {
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
     ) {
+        client.send_tool_call(tool_call_from_update(&tool_call));
+
         let interaction_id = self.next_permission_interaction_id;
         self.next_permission_interaction_id = self.next_permission_interaction_id.wrapping_add(1);
         let client = client.clone();
@@ -1388,20 +1425,22 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item_id,
+                response_id,
                 delta,
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                let message_id = Some(self.assistant_message_id.clone());
-                let meta = Some(Meta::from_iter([
-                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
-                ]));
+                let streaming_message_id =
+                    self.assistant_message_id_for_response(response_id.as_deref());
+                let message_id = Some(streaming_message_id.clone());
+                let meta = Some(Self::assistant_streaming_meta(&streaming_message_id));
                 client.send_agent_text_with_meta(delta, message_id, meta);
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
                 turn_id,
                 item_id,
+                response_id,
                 delta,
                 summary_index: index,
             })
@@ -1409,28 +1448,30 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item_id,
+                response_id,
                 delta,
                 content_index: index,
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
-                let message_id = Some(self.assistant_message_id.clone());
-                let meta = Some(Meta::from_iter([
-                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
-                ]));
+                let streaming_message_id =
+                    self.assistant_message_id_for_response(response_id.as_deref());
+                let message_id = Some(streaming_message_id.clone());
+                let meta = Some(Self::assistant_streaming_meta(&streaming_message_id));
                 client.send_agent_thought_with_meta(delta, message_id, meta);
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
+                response_id,
                 summary_index,
             }) => {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
-                let message_id = Some(self.assistant_message_id.clone());
-                let meta = Some(Meta::from_iter([
-                    ("cognition.ai/streamingMessageId".to_string(), serde_json::json!(self.assistant_message_id))
-                ]));
+                let streaming_message_id =
+                    self.assistant_message_id_for_response(response_id.as_deref());
+                let message_id = Some(streaming_message_id.clone());
+                let meta = Some(Self::assistant_streaming_meta(&streaming_message_id));
                 client.send_agent_thought_with_meta("\n\n", message_id, meta);
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
@@ -2915,9 +2956,12 @@ impl SessionClient {
     }
 
     fn send_user_message(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
-            text.into().into(),
-        )));
+        fn inner(this: &SessionClient, text: String) {
+            this.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                text.into(),
+            )));
+        }
+        inner(self, text.into());
     }
 
     fn send_user_message_with_meta(
@@ -2926,16 +2970,27 @@ impl SessionClient {
         message_id: Option<String>,
         meta: Option<Meta>,
     ) {
-        let mut chunk = ContentChunk::new(text.into().into());
-        chunk.message_id = message_id;
-        chunk.meta = meta;
-        self.send_notification(SessionUpdate::UserMessageChunk(chunk));
+        fn inner(
+            this: &SessionClient,
+            text: String,
+            message_id: Option<String>,
+            meta: Option<Meta>,
+        ) {
+            let mut chunk = ContentChunk::new(text.into());
+            chunk.message_id = message_id;
+            chunk.meta = meta;
+            this.send_notification(SessionUpdate::UserMessageChunk(chunk));
+        }
+        inner(self, text.into(), message_id, meta);
     }
 
     fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            text.into().into(),
-        )));
+        fn inner(this: &SessionClient, text: String) {
+            this.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                text.into(),
+            )));
+        }
+        inner(self, text.into());
     }
 
     fn send_agent_text_with_meta(
@@ -2944,16 +2999,27 @@ impl SessionClient {
         message_id: Option<String>,
         meta: Option<Meta>,
     ) {
-        let mut chunk = ContentChunk::new(text.into().into());
-        chunk.message_id = message_id;
-        chunk.meta = meta;
-        self.send_notification(SessionUpdate::AgentMessageChunk(chunk));
+        fn inner(
+            this: &SessionClient,
+            text: String,
+            message_id: Option<String>,
+            meta: Option<Meta>,
+        ) {
+            let mut chunk = ContentChunk::new(text.into());
+            chunk.message_id = message_id;
+            chunk.meta = meta;
+            this.send_notification(SessionUpdate::AgentMessageChunk(chunk));
+        }
+        inner(self, text.into(), message_id, meta);
     }
 
     fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-            text.into().into(),
-        )));
+        fn inner(this: &SessionClient, text: String) {
+            this.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                text.into(),
+            )));
+        }
+        inner(self, text.into());
     }
 
     fn send_agent_thought_with_meta(
@@ -2962,10 +3028,18 @@ impl SessionClient {
         message_id: Option<String>,
         meta: Option<Meta>,
     ) {
-        let mut chunk = ContentChunk::new(text.into().into());
-        chunk.message_id = message_id;
-        chunk.meta = meta;
-        self.send_notification(SessionUpdate::AgentThoughtChunk(chunk));
+        fn inner(
+            this: &SessionClient,
+            text: String,
+            message_id: Option<String>,
+            meta: Option<Meta>,
+        ) {
+            let mut chunk = ContentChunk::new(text.into());
+            chunk.message_id = message_id;
+            chunk.meta = meta;
+            this.send_notification(SessionUpdate::AgentThoughtChunk(chunk));
+        }
+        inner(self, text.into(), message_id, meta);
     }
 
     fn send_tool_call(&self, tool_call: ToolCall) {
@@ -3037,6 +3111,20 @@ impl SessionClient {
             ))
             .await
     }
+}
+
+fn tool_call_from_update(update: &ToolCallUpdate) -> ToolCall {
+    let mut tool_call = ToolCall::new(
+        update.tool_call_id.clone(),
+        update
+            .fields
+            .title
+            .clone()
+            .unwrap_or_else(|| "Permission Request".to_string()),
+    );
+    tool_call.update(update.fields.clone());
+    tool_call.meta = update.meta.clone();
+    tool_call
 }
 
 struct ThreadActor<A> {
@@ -5058,6 +5146,7 @@ mod tests {
                     text: INIT_COMMAND_PROMPT.to_string(),
                     text_elements: vec![]
                 }],
+                additional_context: Default::default(),
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
@@ -5568,6 +5657,7 @@ mod tests {
                                             thread_id: id.to_string(),
                                             turn_id: id.to_string(),
                                             item_id: id.to_string(),
+                                            response_id: None,
                                             delta: prompt.clone(),
                                         },
                                     ),
@@ -5607,6 +5697,7 @@ mod tests {
                                     collaboration_mode_kind: ModeKind::default(),
                                     turn_id: id.to_string(),
                                     started_at: None,
+                                    trace_id: None,
                                 }),
                             })
                             .unwrap();
@@ -5737,6 +5828,18 @@ mod tests {
                     items: Vec::new(),
                 })
             })
+        }
+
+        fn mcp_connection_manager(
+            &self,
+        ) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>> {
+            Arc::new(tokio::sync::RwLock::new(
+                codex_mcp::McpConnectionManager::new_uninitialized_with_permission_profile(
+                    &codex_config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::OnRequest),
+                    &codex_protocol::models::PermissionProfile::default(),
+                    false,
+                ),
+            ))
         }
     }
 

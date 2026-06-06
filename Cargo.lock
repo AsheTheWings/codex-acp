@@ -1616,6 +1616,7 @@ dependencies = [
  "codex-exec-server",
  "codex-extension-api",
  "codex-login",
+ "codex-mcp",
  "codex-mcp-server",
  "codex-models-manager",
  "codex-protocol",

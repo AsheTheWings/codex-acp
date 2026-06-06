@@ -27,6 +27,7 @@ codex-config = { path = "../codex/codex-rs/config" }
 codex-core = { path = "../codex/codex-rs/core" }
 codex-exec-server = { path = "../codex/codex-rs/exec-server" }
 codex-extension-api = { path = "../codex/codex-rs/ext/extension-api" }
+codex-mcp = { path = "../codex/codex-rs/codex-mcp" }
 codex-mcp-server = { path = "../codex/codex-rs/mcp-server" }
 codex-models-manager = { path = "../codex/codex-rs/models-manager" }
 codex-protocol = { path = "../codex/codex-rs/protocol" }
@@ -61,3 +62,9 @@ unused = "warn"
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3

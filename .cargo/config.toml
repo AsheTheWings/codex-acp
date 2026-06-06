@@ -1,2 +1,7 @@
 [build]
 target-dir = "../codex/codex-rs/target"
+rustflags = ["-C", "debuginfo=0"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "debuginfo=0"]

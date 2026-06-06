@@ -1,4 +1,5 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
+#![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use agent_client_protocol::ByteStreams;
@@ -90,12 +91,12 @@ pub async fn run_main(
 
     let agent = Arc::new(codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?);
 
-    let file_log_enabled = std::env::var("ACP_FILE_LOG")
+    let file_log_enabled = std::env::var("DCODEX_FILE_LOG")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
     let stdin: std::pin::Pin<Box<dyn futures::io::AsyncRead + Send + Unpin>> = if file_log_enabled {
-        let log_dir = std::env::var("ACP_LOG_DIR")
+        let log_dir = std::env::var("DCODEX_LOG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/root/Desktop/tmp"));
 
@@ -103,7 +104,8 @@ pub async fn run_main(
 
         let stdin_log = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(log_dir.join("codex_acp_stdin.log"))?;
 
         Box::pin(
@@ -119,7 +121,7 @@ pub async fn run_main(
 
     let stdout: std::pin::Pin<Box<dyn futures::io::AsyncWrite + Send + Unpin>> = if file_log_enabled
     {
-        let log_dir = std::env::var("ACP_LOG_DIR")
+        let log_dir = std::env::var("DCODEX_LOG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/root/Desktop/tmp"));
 
@@ -127,7 +129,8 @@ pub async fn run_main(
 
         let stdout_log = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(log_dir.join("codex_acp_stdout.log"))?;
 
         Box::pin(

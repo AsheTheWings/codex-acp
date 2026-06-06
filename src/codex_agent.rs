@@ -7,9 +7,10 @@ use acp::schema::{
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
     McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
@@ -28,7 +29,7 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource},
+    protocol::{InitialHistory, Op, SessionSource},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -80,6 +81,75 @@ pub struct RevertExecuteResponse {
     pub forked_session_id: SessionId,
     pub outcomes: Vec<serde_json::Value>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/mcp/listServers", response = McpListServersResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpListServersRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpListServersResponse {
+    pub servers: Vec<McpServerStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStatus {
+    pub server_id: String,
+    pub disabled: bool,
+    pub disabled_tools: Vec<String>,
+    pub connection_status: String,
+    pub source_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/mcp/connectServer", response = McpConnectServerResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConnectServerRequest {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConnectServerResponse {
+    pub connection_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/mcp/listTools", response = McpListToolsResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpListToolsRequest {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpListToolsResponse {
+    pub server_id: String,
+    pub tools: Vec<McpToolDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolDetail {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_cognition.ai/mcp/toggleTool", response = McpToggleToolResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToggleToolRequest {
+    pub server_id: String,
+    pub tool_name: String,
+    pub source_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToggleToolResponse {}
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -380,6 +450,66 @@ impl CodexAgent {
                 },
                 acp::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: McpListServersRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.mcp_list_servers(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: McpConnectServerRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.mcp_connect_server(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: McpListToolsRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.mcp_list_tools(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: McpToggleToolRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.mcp_toggle_tool(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
             .connect_to(transport)
             .await
     }
@@ -396,6 +526,17 @@ impl CodexAgent {
             .get(session_id)
             .ok_or_else(|| Error::resource_not_found(None))?
             .clone())
+    }
+
+    fn get_any_active_thread(&self) -> Result<Arc<Thread>, Error> {
+        let sessions = self.sessions.lock().unwrap();
+        if let Some(thread) = sessions.values().next() {
+            Ok(Arc::clone(thread))
+        } else {
+            Err(Error::resource_not_found(Some(
+                "No active sessions".to_string(),
+            )))
+        }
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
@@ -542,34 +683,67 @@ impl CodexAgent {
 
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .mcp_capabilities(McpCapabilities::new().http(true))
+            .mcp_capabilities(McpCapabilities::new().http(false).sse(false))
             .load_session(true)
             .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
-            .list(SessionListCapabilities::new());
+            .list(SessionListCapabilities::new())
+            .additional_directories(SessionAdditionalDirectoriesCapabilities::new());
 
-        agent_capabilities.meta = client_capabilities.meta;
+        let mut agent_meta = client_capabilities.meta.unwrap_or_default();
+        agent_meta.insert(
+            "cognition.ai/mcp".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        agent_meta.insert(
+            "cognition.ai/canManageMcpServers".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        agent_meta.insert(
+            "cognition.ai/sessionRename".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        agent_meta.insert(
+            "cognition.ai/documentLifecycle".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        agent_capabilities.meta = Some(agent_meta);
 
         let mut auth_methods = vec![
+            CodexAuthMethod::WindsurfApiKey.into(),
             CodexAuthMethod::ChatGpt.into(),
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
         ];
         // Until codex device code auth works, we can't use this in remote ssh projects
         if std::env::var("NO_BROWSER").is_ok() {
-            auth_methods.remove(0);
+            auth_methods.remove(1);
         }
 
-        let mut response = InitializeResponse::new(protocol_version)
+        let mut response_meta = serde_json::Map::new();
+        if let Some(meta) = meta {
+            response_meta.extend(meta);
+        }
+
+        let mcp_config_path = self.config.codex_home.join(codex_config::CONFIG_TOML_FILE);
+
+        response_meta.insert(
+            "mcpConfigPath".to_string(),
+            serde_json::json!(mcp_config_path.to_string_lossy()),
+        );
+
+        response_meta.insert(
+            "cognition.ai/canManageMcpServers".to_string(),
+            serde_json::json!(true),
+        );
+
+        let response = InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
             .agent_info(Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
-            .auth_methods(auth_methods);
-
-        if let Some(meta) = meta {
-            response = response.meta(meta);
-        }
+            .auth_methods(auth_methods)
+            .meta(response_meta);
 
         Ok(response)
     }
@@ -634,6 +808,7 @@ impl CodexAgent {
                 )
                 .map_err(Error::into_internal_error)?;
             }
+            CodexAuthMethod::WindsurfApiKey => {}
         }
 
         self.auth_manager.reload().await;
@@ -972,6 +1147,223 @@ impl CodexAgent {
             outcomes: Vec::new(),
         })
     }
+
+    fn get_active_session_id_and_cwd(&self) -> Result<(SessionId, PathBuf), Error> {
+        let sessions = self.sessions.lock().unwrap();
+        if let Some((session_id, _)) = sessions.iter().next() {
+            let roots = self.session_roots.lock().unwrap();
+            if let Some(cwd) = roots.get(session_id) {
+                return Ok((session_id.clone(), cwd.clone()));
+            }
+        }
+        Err(Error::resource_not_found(Some(
+            "No active sessions".to_string(),
+        )))
+    }
+
+    async fn mcp_list_servers(
+        &self,
+        _request: McpListServersRequest,
+    ) -> Result<McpListServersResponse, Error> {
+        info!("Listing MCP servers");
+        let thread = self.get_any_active_thread()?;
+        let config = thread.config().await;
+
+        let mcp_manager = self.thread_manager.mcp_manager();
+        let mcp_servers = mcp_manager.configured_servers(&config).await;
+
+        let manager = thread.mcp_connection_manager();
+        let manager_read = manager.read().await;
+
+        let mut servers = Vec::new();
+        let source_path = self.config.codex_home.join(codex_config::CONFIG_TOML_FILE).to_string_lossy().to_string();
+
+        for (name, cfg) in mcp_servers {
+            let connection_status = manager_read.get_server_connection_status(&name).await;
+
+            servers.push(McpServerStatus {
+                server_id: name,
+                disabled: !cfg.enabled,
+                disabled_tools: cfg.disabled_tools.clone().unwrap_or_default(),
+                connection_status,
+                source_path: source_path.clone(),
+            });
+        }
+
+        Ok(McpListServersResponse { servers })
+    }
+
+    async fn mcp_connect_server(
+        &self,
+        request: McpConnectServerRequest,
+    ) -> Result<McpConnectServerResponse, Error> {
+        info!("Connecting to MCP server: {}", request.server_id);
+        let thread = self.get_any_active_thread()?;
+        let manager = thread.mcp_connection_manager();
+
+        let has_client = {
+            let manager_read = manager.read().await;
+            manager_read
+                .get_server_connection_status(&request.server_id)
+                .await
+                != "not_started"
+        };
+
+        if !has_client {
+            if let Ok((_session_id, cwd)) = self.get_active_session_id_and_cwd() {
+                let config = self.build_session_config(&cwd, vec![])?;
+
+                let mcp_servers = config.mcp_servers.get().clone();
+                let refresh_config = codex_protocol::protocol::McpServerRefreshConfig {
+                    mcp_servers: serde_json::to_value(mcp_servers)
+                        .map_err(|e| Error::internal_error().data(e.to_string()))?,
+                    mcp_oauth_credentials_store_mode: serde_json::to_value(
+                        config.mcp_oauth_credentials_store_mode,
+                    )
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?,
+                };
+
+                thread
+                    .submit(Op::RefreshMcpServers {
+                        config: refresh_config,
+                    })
+                    .await
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            }
+        }
+
+        let is_ready = {
+            let manager_read = manager.read().await;
+            manager_read
+                .wait_for_server_ready(&request.server_id, std::time::Duration::from_secs(10))
+                .await
+        };
+
+        let status = if is_ready {
+            "connected".to_string()
+        } else {
+            let manager_read = manager.read().await;
+            manager_read
+                .get_server_connection_status(&request.server_id)
+                .await
+        };
+
+        Ok(McpConnectServerResponse {
+            connection_status: status,
+        })
+    }
+
+    async fn mcp_list_tools(
+        &self,
+        request: McpListToolsRequest,
+    ) -> Result<McpListToolsResponse, Error> {
+        info!("Listing tools for MCP server: {}", request.server_id);
+        let thread = self.get_any_active_thread()?;
+        let manager = thread.mcp_connection_manager();
+        let manager_read = manager.read().await;
+
+        let mut tools = Vec::new();
+        if let Some(server_tools) = manager_read.list_tools_for_server(&request.server_id).await {
+            for t in server_tools {
+                let mut name = t.tool.name.to_string();
+                let prefix_double = format!("{}__", request.server_id);
+                let prefix_single = format!("{}_", request.server_id);
+                if name.starts_with(&prefix_double) {
+                    name = name.split_off(prefix_double.len());
+                } else if name.starts_with(&prefix_single) {
+                    name = name.split_off(prefix_single.len());
+                }
+
+                tools.push(McpToolDetail {
+                    name,
+                    description: t.tool.description.as_ref().map(|s| s.to_string()),
+                    input_schema: serde_json::Value::Object((*t.tool.input_schema).clone()),
+                });
+            }
+        }
+
+        Ok(McpListToolsResponse {
+            server_id: request.server_id,
+            tools,
+        })
+    }
+
+    async fn mcp_toggle_tool(
+        &self,
+        request: McpToggleToolRequest,
+    ) -> Result<McpToggleToolResponse, Error> {
+        info!(
+            "Toggling tool: {} on server: {}",
+            request.tool_name, request.server_id
+        );
+
+        let thread = self.get_any_active_thread()?;
+        let config = thread.config().await;
+
+        let mcp_manager = self.thread_manager.mcp_manager();
+        let mcp_servers = mcp_manager.configured_servers(&config).await;
+
+        let mut disabled_tools = if let Some(server_cfg) = mcp_servers.get(&request.server_id) {
+            server_cfg.disabled_tools.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let tool_pos = disabled_tools.iter().position(|v| v == &request.tool_name);
+        if let Some(pos) = tool_pos {
+            disabled_tools.remove(pos);
+        } else {
+            disabled_tools.push(request.tool_name.clone());
+        }
+
+        let codex_home = self.config.codex_home.clone();
+
+        codex_config::ConfigEditsBuilder::new(&codex_home)
+            .with_edits([codex_config::ConfigEdit::SetPath {
+                segments: vec![
+                    "mcp_servers".to_string(),
+                    request.server_id.clone(),
+                    "disabled_tools".to_string(),
+                ],
+                value: codex_config::TomlValue::Array(
+                    disabled_tools
+                        .into_iter()
+                        .map(codex_config::TomlValue::String)
+                        .collect(),
+                ),
+            }])
+            .apply()
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        // Refresh the runtime config in the active thread by reloading from disk
+        let next_config = codex_core::config::Config::load_with_cli_overrides(vec![])
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        thread.refresh_runtime_config(next_config).await;
+
+        // Trigger a refresh of the session configuration with the updated configs
+        let reloaded_config = thread.config().await;
+        let refreshed_mcp_servers = mcp_manager.configured_servers(&reloaded_config).await;
+        let refresh_config = codex_protocol::protocol::McpServerRefreshConfig {
+            mcp_servers: serde_json::to_value(refreshed_mcp_servers)
+                .map_err(|e| Error::internal_error().data(e.to_string()))?,
+            mcp_oauth_credentials_store_mode: serde_json::to_value(
+                reloaded_config.mcp_oauth_credentials_store_mode,
+            )
+            .map_err(|e| Error::internal_error().data(e.to_string()))?,
+        };
+
+        thread
+            .submit(Op::RefreshMcpServers {
+                config: refresh_config,
+            })
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        Ok(McpToggleToolResponse {})
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,6 +1371,7 @@ enum CodexAuthMethod {
     ChatGpt,
     CodexApiKey,
     OpenAiApiKey,
+    WindsurfApiKey,
 }
 
 impl From<CodexAuthMethod> for AuthMethodId {
@@ -987,6 +1380,7 @@ impl From<CodexAuthMethod> for AuthMethodId {
             CodexAuthMethod::ChatGpt => "chatgpt",
             CodexAuthMethod::CodexApiKey => "codex-api-key",
             CodexAuthMethod::OpenAiApiKey => "openai-api-key",
+            CodexAuthMethod::WindsurfApiKey => "windsurf-api-key",
         })
     }
 }
@@ -1019,6 +1413,10 @@ impl From<CodexAuthMethod> for AuthMethod {
                     "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
                 )),
             ),
+            CodexAuthMethod::WindsurfApiKey => Self::Agent(
+                AuthMethodAgent::new(method, "API Key")
+                    .description("Authenticate with your API key"),
+            ),
         }
     }
 }
@@ -1031,6 +1429,7 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "chatgpt" => Ok(CodexAuthMethod::ChatGpt),
             "codex-api-key" => Ok(CodexAuthMethod::CodexApiKey),
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
+            "windsurf-api-key" => Ok(CodexAuthMethod::WindsurfApiKey),
             _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
     }
