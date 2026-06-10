@@ -1288,55 +1288,55 @@ impl CodexAgent {
         })
     }
 
-    async fn mcp_toggle_tool(
-        &self,
-        request: McpToggleToolRequest,
-    ) -> Result<McpToggleToolResponse, Error> {
-        info!(
-            "Toggling tool: {} on server: {}",
-            request.tool_name, request.server_id
-        );
+   async fn mcp_toggle_tool(
+       &self,
+       request: McpToggleToolRequest,
+   ) -> Result<McpToggleToolResponse, Error> {
+       info!(
+           "Toggling tool: {} on server: {}",
+           request.tool_name, request.server_id
+       );
 
-        let thread = self.get_any_active_thread()?;
-        let config = thread.config().await;
+       let thread = self.get_any_active_thread()?;
+       let config = thread.config().await;
 
-        let mcp_manager = self.thread_manager.mcp_manager();
-        let mcp_servers = mcp_manager.configured_servers(&config).await;
+       let mcp_manager = self.thread_manager.mcp_manager();
+       let mcp_servers = mcp_manager.configured_servers(&config).await;
 
-        let mut disabled_tools = if let Some(server_cfg) = mcp_servers.get(&request.server_id) {
-            server_cfg.disabled_tools.clone().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+       let mut disabled_tools = if let Some(server_cfg) = mcp_servers.get(&request.server_id) {
+           server_cfg.disabled_tools.clone().unwrap_or_default()
+       } else {
+           Vec::new()
+       };
 
-        let tool_pos = disabled_tools.iter().position(|v| v == &request.tool_name);
-        if let Some(pos) = tool_pos {
-            disabled_tools.remove(pos);
-        } else {
-            disabled_tools.push(request.tool_name.clone());
+       let tool_pos = disabled_tools.iter().position(|v| v == &request.tool_name);
+       if let Some(pos) = tool_pos {
+           disabled_tools.remove(pos);
+       } else {
+           disabled_tools.push(request.tool_name.clone());
+       }
+
+       let codex_home = self.config.codex_home.clone();
+
+        let mut disabled_tools_array = toml_edit::Array::new();
+        for tool in disabled_tools {
+            disabled_tools_array.push(tool);
         }
 
-        let codex_home = self.config.codex_home.clone();
-
-        codex_config::ConfigEditsBuilder::new(&codex_home)
-            .with_edits([codex_config::ConfigEdit::SetPath {
+        codex_core::config::edit::ConfigEditsBuilder::new(&codex_home)
+            .with_edits([codex_core::config::edit::ConfigEdit::SetPath {
                 segments: vec![
                     "mcp_servers".to_string(),
                     request.server_id.clone(),
                     "disabled_tools".to_string(),
                 ],
-                value: codex_config::TomlValue::Array(
-                    disabled_tools
-                        .into_iter()
-                        .map(codex_config::TomlValue::String)
-                        .collect(),
-                ),
+                value: toml_edit::value(disabled_tools_array),
             }])
             .apply()
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        // Refresh the runtime config in the active thread by reloading from disk
+       // Refresh the runtime config in the active thread by reloading from disk
         let next_config = codex_core::config::Config::load_with_cli_overrides(vec![])
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;

@@ -1602,43 +1602,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9b18233253483ce2f65329a24072ec414db782531bdbb7d0bbc4bd2ce6b7e21"
 
 [[package]]
-name = "codex-acp"
-version = "0.15.0"
-dependencies = [
- "agent-client-protocol",
- "allocative",
- "anyhow",
- "clap",
- "codex-apply-patch",
- "codex-arg0",
- "codex-config",
- "codex-core",
- "codex-exec-server",
- "codex-extension-api",
- "codex-login",
- "codex-mcp",
- "codex-mcp-server",
- "codex-models-manager",
- "codex-protocol",
- "codex-shell-command",
- "codex-utils-approval-presets",
- "codex-utils-cli",
- "diffy",
- "futures",
- "heck",
- "itertools 0.14.0",
- "serde",
- "serde_json",
- "shlex 1.3.0",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "unicode-segmentation",
- "uuid",
-]
-
-[[package]]
 name = "codex-agent-identity"
 version = "0.0.0"
 dependencies = [
@@ -2166,6 +2129,44 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "serde",
+]
+
+[[package]]
+name = "codex-for-devin"
+version = "0.15.0"
+dependencies = [
+ "agent-client-protocol",
+ "allocative",
+ "anyhow",
+ "clap",
+ "codex-apply-patch",
+ "codex-arg0",
+ "codex-config",
+ "codex-core",
+ "codex-exec-server",
+ "codex-extension-api",
+ "codex-login",
+ "codex-mcp",
+ "codex-mcp-server",
+ "codex-models-manager",
+ "codex-protocol",
+ "codex-shell-command",
+ "codex-utils-approval-presets",
+ "codex-utils-cli",
+ "diffy",
+ "futures",
+ "heck",
+ "itertools 0.14.0",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
+ "tokio",
+ "tokio-util",
+ "toml_edit 0.24.1+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]

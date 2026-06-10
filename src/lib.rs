@@ -1,4 +1,4 @@
-//! Codex ACP - An Agent Client Protocol implementation for Codex.
+//! Codex for Devin - An Agent Client Protocol implementation for Codex.
 #![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
@@ -30,11 +30,11 @@ pub async fn run_main(
     codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,
 ) -> std::io::Result<()> {
-    // Manually parse .env from the current working directory or fallback to `/root/Desktop/codex-acp/.env`
+    // Manually parse .env from the current working directory or fallback to `/root/Desktop/codex-for-devin/.env`
     let env_path = if std::path::Path::new(".env").exists() {
         std::path::PathBuf::from(".env")
     } else {
-        std::path::PathBuf::from("/root/Desktop/codex-acp/.env")
+        std::path::PathBuf::from("/root/Desktop/codex-for-devin/.env")
     };
     if let Ok(content) = std::fs::read_to_string(&env_path) {
         for line in content.lines() {
@@ -106,7 +106,7 @@ pub async fn run_main(
             .create(true)
             .write(true)
             .truncate(true)
-            .open(log_dir.join("codex_acp_stdin.log"))?;
+            .open(log_dir.join("codex_for_devin_stdin.log"))?;
 
         Box::pin(
             LoggingReader {
@@ -131,7 +131,7 @@ pub async fn run_main(
             .create(true)
             .write(true)
             .truncate(true)
-            .open(log_dir.join("codex_acp_stdout.log"))?;
+            .open(log_dir.join("codex_for_devin_stdout.log"))?;
 
         Box::pin(
             LoggingWriter {

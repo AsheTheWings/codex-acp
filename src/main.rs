@@ -6,7 +6,7 @@ use codex_utils_cli::CliConfigOverrides;
 fn main() -> Result<()> {
     arg0_dispatch_or_else(|args| async move {
         let cli_config_overrides = CliConfigOverrides::parse();
-        codex_acp::run_main(args.codex_linux_sandbox_exe, cli_config_overrides).await?;
+        codex_for_devin::run_main(args.codex_linux_sandbox_exe, cli_config_overrides).await?;
         Ok(())
     })
 }

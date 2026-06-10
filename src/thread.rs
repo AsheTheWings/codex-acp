@@ -234,6 +234,11 @@ pub trait CodexThreadImpl: Send + Sync {
         >,
     >;
     fn mcp_connection_manager(&self) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>>;
+    fn config(&self) -> Pin<Box<dyn Future<Output = Arc<Config>> + Send + '_>>;
+    fn refresh_runtime_config(
+        &self,
+        next_config: Config,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -277,6 +282,17 @@ impl CodexThreadImpl for CodexThread {
 
     fn mcp_connection_manager(&self) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>> {
         self.mcp_connection_manager()
+    }
+
+    fn config(&self) -> Pin<Box<dyn Future<Output = Arc<Config>> + Send + '_>> {
+        Box::pin(self.config())
+    }
+
+    fn refresh_runtime_config(
+        &self,
+        next_config: Config,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.refresh_runtime_config(next_config))
     }
 }
 
@@ -411,6 +427,14 @@ impl Thread {
         &self,
     ) -> Arc<tokio::sync::RwLock<codex_mcp::McpConnectionManager>> {
         self.thread.mcp_connection_manager()
+    }
+
+    pub async fn config(&self) -> Arc<Config> {
+        self.thread.config().await
+    }
+
+    pub async fn refresh_runtime_config(&self, next_config: Config) {
+        self.thread.refresh_runtime_config(next_config).await;
     }
 
     pub async fn submit(&self, op: Op) -> Result<String, Error> {
@@ -5840,6 +5864,19 @@ mod tests {
                     false,
                 ),
             ))
+        }
+
+        fn config(&self) -> Pin<Box<dyn Future<Output = Arc<Config>> + Send + '_>> {
+            Box::pin(async move {
+                Arc::new(Config::load_with_cli_overrides(vec![]).await.unwrap())
+            })
+        }
+
+        fn refresh_runtime_config(
+            &self,
+            _next_config: Config,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {})
         }
     }
 
